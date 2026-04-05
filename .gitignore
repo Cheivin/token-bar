@@ -1,0 +1,30 @@
+# Binaries
+token-bar
+token-bar_arm64
+token-bar_amd64
+
+# App bundle
+Token-Bar.app/
+
+# Distribution
+dist/
+
+# Build artifacts
+*.icns
+*.iconset/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Config (user-specific)
+.token-bar/
+
+# Debug
+debug

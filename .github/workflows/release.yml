@@ -1,0 +1,67 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      - name: Get version
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+      - name: Build universal binary
+        run: |
+          CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 CC="clang -target arm64-apple-macos11" go build -o token-bar_arm64 .
+          CGO_ENABLED=1 GOOS=darwin GOARCH=amd64 CC="clang -target x86_64-apple-macos10.12" go build -o token-bar_amd64 .
+          lipo -create -output token-bar token-bar_arm64 token-bar_amd64
+          rm -f token-bar_arm64 token-bar_amd64
+
+      - name: Create app bundle
+        run: |
+          mkdir -p Token-Bar.app/Contents/MacOS
+          mkdir -p Token-Bar.app/Contents/Resources
+          cp token-bar Token-Bar.app/Contents/MacOS/
+          cp packaging/Info.plist Token-Bar.app/Contents/
+          
+          # Generate icon if source exists
+          if [ -f packaging/icon.jpg ]; then
+            mkdir -p packaging/Token-Bar.iconset
+            sips -s format png -z 16 16 packaging/icon.jpg --out packaging/Token-Bar.iconset/icon_16x16.png
+            sips -s format png -z 32 32 packaging/icon.jpg --out packaging/Token-Bar.iconset/icon_16x16@2x.png
+            sips -s format png -z 32 32 packaging/icon.jpg --out packaging/Token-Bar.iconset/icon_32x32.png
+            sips -s format png -z 64 64 packaging/icon.jpg --out packaging/Token-Bar.iconset/icon_32x32@2x.png
+            sips -s format png -z 128 128 packaging/icon.jpg --out packaging/Token-Bar.iconset/icon_128x128.png
+            sips -s format png -z 256 256 packaging/icon.jpg --out packaging/Token-Bar.iconset/icon_128x128@2x.png
+            sips -s format png -z 256 256 packaging/icon.jpg --out packaging/Token-Bar.iconset/icon_256x256.png
+            sips -s format png -z 512 512 packaging/icon.jpg --out packaging/Token-Bar.iconset/icon_256x256@2x.png
+            sips -s format png -z 512 512 packaging/icon.jpg --out packaging/Token-Bar.iconset/icon_512x512.png
+            sips -s format png -z 1024 1024 packaging/icon.jpg --out packaging/Token-Bar.iconset/icon_512x512@2x.png
+            iconutil -c icns packaging/Token-Bar.iconset -o Token-Bar.app/Contents/Resources/icon.icns
+            rm -rf packaging/Token-Bar.iconset
+          fi
+
+      - name: Create zip archive
+        run: |
+          mkdir -p dist
+          zip -r dist/Token-Bar-${{ steps.version.outputs.VERSION }}.zip Token-Bar.app
+
+      - name: Upload Release Asset
+        uses: softprops/action-gh-release@v1
+        with:
+          files: dist/*.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
