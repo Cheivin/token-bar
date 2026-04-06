@@ -9,9 +9,9 @@
 	<key>CFBundleIdentifier</key>
 	<string>com.cheivin.token-bar</string>
 	<key>CFBundleVersion</key>
-	<string>0.0.1</string>
+	<string>0.0.2</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.0.1</string>
+	<string>0.0.2</string>
 	<key>CFBundleExecutable</key>
 	<string>token-bar</string>
 	<key>CFBundleIconFile</key>

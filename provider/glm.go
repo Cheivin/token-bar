@@ -104,16 +104,29 @@ func (g *glmProvider) Fetch() (*ProviderResult, error) {
 
 	// 组装 ProviderResult
 	result := &ProviderResult{
-		Title:    fmt.Sprintf("5H:%.0f%% | W:%.0f%%", data.token5HourPct, data.tokenWeeklyPct),
-		Subtitle: fmt.Sprintf("5小时窗口 | 重置 %s", data.token5HourReset),
-		Items: []InfoItem{
-			{Label: "5小时", Value: ""},
-			{Label: "  使用率", Value: fmt.Sprintf("%.2f%%", data.token5HourPct)},
-			{Label: "  重置", Value: data.token5HourReset},
-			{Label: "每周", Value: ""},
-			{Label: "  使用率", Value: fmt.Sprintf("%.2f%%", data.tokenWeeklyPct)},
-			{Label: "  重置", Value: data.tokenWeeklyReset},
-		},
+		Title: fmt.Sprintf("5H:%.0f%% | W:%.0f%%", data.token5HourPct, data.tokenWeeklyPct),
+		Items: []InfoItem{},
+	}
+
+	// 5小时窗口
+	result.Items = append(result.Items,
+		InfoItem{Label: "5小时", Value: ""},
+		InfoItem{Label: "  使用率", Value: fmt.Sprintf("%.2f%%", data.token5HourPct)},
+	)
+	if data.token5HourReset != "" {
+		result.Items = append(result.Items, InfoItem{Label: "  重置", Value: data.token5HourReset})
+		result.Subtitle = fmt.Sprintf("5小时窗口 | 重置 %s", data.token5HourReset)
+	} else {
+		result.Subtitle = "5小时窗口"
+	}
+
+	// 每周窗口
+	result.Items = append(result.Items,
+		InfoItem{Label: "每周", Value: ""},
+		InfoItem{Label: "  使用率", Value: fmt.Sprintf("%.2f%%", data.tokenWeeklyPct)},
+	)
+	if data.tokenWeeklyReset != "" {
+		result.Items = append(result.Items, InfoItem{Label: "  重置", Value: data.tokenWeeklyReset})
 	}
 
 	// MCP 每月用量（如果有数据）

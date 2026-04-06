@@ -1,6 +1,6 @@
 APP_NAME    := Token-Bar
 BINARY      := token-bar
-VERSION     := 0.0.1
+VERSION     := 0.0.2
 BUNDLE_ID   := com.cheivin.token-bar
 
 APP_DIR     := $(APP_NAME).app
