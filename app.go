@@ -10,73 +10,92 @@ import (
 
 	"token-bar/provider"
 
-	"fyne.io/systray"
+	"github.com/progrium/darwinkit/dispatch"
+	"github.com/progrium/darwinkit/macos/appkit"
+	"github.com/progrium/darwinkit/macos/foundation"
+	"github.com/progrium/darwinkit/objc"
 )
 
-// app 应用主结构体
+// app 应用主结构体（基于 darwinkit / NSStatusItem 重新实现）
 type app struct {
-	config        *Config
-	providers     []providerInstance
-	mu            sync.Mutex
-	cancelFuncs   []context.CancelFunc
-	pendingReload bool
-	menuCtx       context.Context
-	menuCancel    context.CancelFunc
-	settings      settingsMenuItems // 当前设置菜单项引用
+	app     appkit.Application
+	config  *Config
+	status  *appkit.StatusItem // 状态栏项（常驻，刷新时仅更新标题/菜单）
+	menu    *appkit.Menu       // 状态栏菜单（常驻，刷新时 RemoveAllItems 后重建）
+	button  appkit.StatusBarButton
+	primary string // primary provider 的 tooltip
+
+	providers   []providerInstance
+	mu          sync.Mutex // 保护菜单重建
+	cancelFuncs []context.CancelFunc
+
+	settings settingsMenuItems // 当前设置菜单项引用
 }
 
 // providerInstance 单个 provider 运行时实例
 type providerInstance struct {
 	config   provider.ProviderConfig
 	provider provider.Provider
-	menu     providerMenuState
+	state    *providerMenuState
 }
 
-// providerMenuState provider 菜单状态
+// providerMenuState provider 菜单构建状态
 type providerMenuState struct {
 	name       string
-	titleItem  *systray.MenuItem
-	items      []*systray.MenuItem
 	lastResult *provider.ProviderResult
 }
 
 // settingsMenuItems 设置菜单项引用
 type settingsMenuItems struct {
-	refresh    *systray.MenuItem
-	reload     *systray.MenuItem
-	openConfig *systray.MenuItem
-	autoLaunch *systray.MenuItem
-	quit       *systray.MenuItem
-}
-
-// all 返回所有设置菜单项（用于 Remove 追踪）
-func (s *settingsMenuItems) all() []*systray.MenuItem {
-	return []*systray.MenuItem{s.refresh, s.reload, s.openConfig, s.autoLaunch, s.quit}
+	refresh    appkit.MenuItem
+	reload     appkit.MenuItem
+	openConfig appkit.MenuItem
+	autoLaunch appkit.MenuItem
+	quit       appkit.MenuItem
 }
 
 // newApp 创建应用实例
-func newApp(cfg *Config) *app {
-	return &app{config: cfg}
+func newApp(cfg *Config, application appkit.Application) *app {
+	return &app{config: cfg, app: application}
 }
 
-// onReady systray 就绪回调
-func (a *app) onReady() {
-	systray.SetTitle("Token Bar")
-
+// start 初始化状态栏并启动刷新
+func (a *app) start(delegate *appkit.ApplicationDelegate) {
+	a.createStatusItem()
 	a.createProviders()
 
-	results := make([]*provider.ProviderResult, len(a.providers))
-	a.rebuildAllMenus(results)
+	// 首次菜单构建（无数据，显示加载中）
+	a.rebuildAllMenus()
+
+	// 应用退出前停止刷新 goroutine
+	delegate.SetApplicationWillTerminate(func(foundation.Notification) {
+		a.stopRefreshLoops()
+	})
 
 	a.startRefreshLoops()
 }
 
-// onExit systray 退出回调
-func (a *app) onExit() {
-	a.stopRefreshLoops()
-	if a.menuCancel != nil {
-		a.menuCancel()
-	}
+// createStatusItem 创建状态栏项（整个生命周期常驻）
+// darwinkit 创建的对象默认是 autorelease 的，会在 autorelease pool 结束时被释放，
+// 必须用 objc.Retain 持有（同时设置 Go 侧 finalizer 防止对象被 GC 回收野指针）。
+// Retain 要求传入独立堆对象，故用局部指针接收后再 Retain。
+func (a *app) createStatusItem() {
+	status := appkit.StatusBar_SystemStatusBar().StatusItemWithLength(appkit.VariableStatusItemLength)
+	objc.Retain(&status)
+	a.status = &status
+	a.status.SetBehavior(appkit.StatusItemBehaviorRemovalAllowed)
+
+	button := a.status.Button()
+	objc.Retain(&button)
+	a.button = button
+	a.button.SetTitle("Token Bar")
+
+	menu := appkit.NewMenuWithTitle("token-bar")
+	objc.Retain(&menu)
+	a.menu = &menu
+	// 关闭"自动启用菜单项"，否则无 selector 的纯展示项会被禁用
+	a.menu.SetAutoenablesItems(false)
+	a.status.SetMenu(*a.menu)
 }
 
 // createProviders 根据配置创建 provider 实例
@@ -95,126 +114,179 @@ func (a *app) createProviders() {
 		a.providers = append(a.providers, providerInstance{
 			config:   cfg,
 			provider: p,
+			state:    &providerMenuState{name: cfg.Name},
 		})
 	}
 }
 
-// rebuildAllMenus 移除所有动态菜单项并重建
-func (a *app) rebuildAllMenus(results []*provider.ProviderResult) {
+// rebuildAllMenus 重建状态栏菜单。必须在主线程调用。
+func (a *app) rebuildAllMenus() {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	// 取消旧的事件监听器
-	if a.menuCancel != nil {
-		a.menuCancel()
-	}
-
-	// 移除旧的 provider 菜单项
+	// 收集所有 provider 的最新结果
+	results := make([]*provider.ProviderResult, len(a.providers))
 	for i := range a.providers {
-		for _, item := range a.providers[i].menu.items {
-			item.Remove()
-		}
-		a.providers[i].menu.items = nil
+		results[i] = a.providers[i].state.lastResult
 	}
 
-	// 按 primary -> secondary 顺序重建
-	for i, p := range a.providers {
-		if p.config.Primary {
+	a.menu.RemoveAllItems()
+
+	// primary provider：一级菜单展示详情
+	for i := range a.providers {
+		if a.providers[i].config.Primary {
 			a.buildPrimaryMenu(i, results[i])
 		}
 	}
-	for i, p := range a.providers {
-		if !p.config.Primary {
+	// secondary provider：子菜单
+	for i := range a.providers {
+		if !a.providers[i].config.Primary {
 			a.buildSecondaryMenu(i, results[i])
 		}
 	}
 
-	// 更新 primary provider 的 tooltip
-	for i, p := range a.providers {
-		if p.config.Primary && results[i] != nil && results[i].Subtitle != "" {
-			systray.SetTooltip(results[i].Subtitle)
+	// 更新状态栏标题与 tooltip（取第一个 primary）
+	a.primary = ""
+	for i := range a.providers {
+		if a.providers[i].config.Primary && results[i] != nil {
+			a.button.SetTitle(results[i].Title)
+			if results[i].Subtitle != "" {
+				a.primary = results[i].Subtitle
+			}
+			break
 		}
 	}
+	a.button.SetToolTip(a.primary)
 
-	// 构建设置菜单并启动事件监听
-	settings := a.buildSettingsMenu()
-	a.settings = settings
-	a.menuCtx, a.menuCancel = context.WithCancel(context.Background())
-	go a.listenSettingsEvents(a.menuCtx, settings)
+	a.settings = a.buildSettingsMenu()
 }
 
 // buildPrimaryMenu 为主 provider 构建详情菜单项
 func (a *app) buildPrimaryMenu(idx int, result *provider.ProviderResult) {
 	if result == nil {
+		a.menu.AddItem(a.infoMenuItem(a.providers[idx].config.Name + " 加载中..."))
+		a.menu.AddItem(appkit.MenuItem_SeparatorItem())
 		return
 	}
-	state := &a.providers[idx].menu
-	if len(result.Items) > 8 {
-		result.Items = result.Items[:8]
-	}
 
-	now := time.Now().Format("15:04:05")
-	for _, item := range result.Items {
-		var m *systray.MenuItem
-		if item.Value == "" {
-			m = systray.AddMenuItem(item.Label, "")
-		} else {
-			m = systray.AddMenuItem(fmt.Sprintf("  %s: %s", item.Label, item.Value), "")
-		}
-		state.items = append(state.items, m)
-	}
-	m := systray.AddMenuItem(fmt.Sprintf("  更新: %s", now), "")
-	state.items = append(state.items, m)
-	systray.AddSeparator()
+	a.addInfoItems(*a.menu, result.Items)
+	a.menu.AddItem(a.infoMenuItem(fmt.Sprintf("  更新: %s", time.Now().Format("15:04:05"))))
+	a.menu.AddItem(appkit.MenuItem_SeparatorItem())
 }
 
 // buildSecondaryMenu 为次 provider 构建子菜单
 func (a *app) buildSecondaryMenu(idx int, result *provider.ProviderResult) {
-	state := &a.providers[idx].menu
+	subMenu := appkit.NewMenuWithTitle(a.providers[idx].config.Name)
+	subMenu.SetAutoenablesItems(false)
 
 	if result == nil {
-		titleItem := systray.AddMenuItem(a.providers[idx].config.Name+" 加载中...", a.providers[idx].config.Name)
-		state.titleItem = titleItem
-		state.items = append(state.items, titleItem)
-		return
+		subMenu.AddItem(a.infoMenuItem(a.providers[idx].config.Name + " 加载中..."))
+	} else {
+		a.addInfoItems(subMenu, result.Items)
+		subMenu.AddItem(a.infoMenuItem(fmt.Sprintf("  更新: %s", time.Now().Format("15:04:05"))))
 	}
 
-	if len(result.Items) > 8 {
-		result.Items = result.Items[:8]
+	// 标题行（含 result.Title 或"加载中"）
+	var headerTitle string
+	if result != nil {
+		headerTitle = fmt.Sprintf("%s  %s", a.providers[idx].config.Name, result.Title)
+	} else {
+		headerTitle = a.providers[idx].config.Name
 	}
-
-	titleItem := systray.AddMenuItem(a.providers[idx].config.Name+" "+result.Title, a.providers[idx].config.Name)
-	state.titleItem = titleItem
-	state.items = append(state.items, titleItem)
-
-	now := time.Now().Format("15:04:05")
-	for _, item := range result.Items {
-		var m *systray.MenuItem
-		if item.Value == "" {
-			m = titleItem.AddSubMenuItem(item.Label, "")
-		} else {
-			m = titleItem.AddSubMenuItem(fmt.Sprintf("  %s: %s", item.Label, item.Value), "")
-		}
-		state.items = append(state.items, m)
-	}
-	m := titleItem.AddSubMenuItem(fmt.Sprintf("  更新: %s", now), "")
-	state.items = append(state.items, m)
+	parent := appkit.NewSubMenuItem(subMenu)
+	parent.SetTitle(headerTitle)
+	a.menu.AddItem(parent)
 }
 
-// buildSettingsMenu 构建设置和退出菜单
-func (a *app) buildSettingsMenu() settingsMenuItems {
-	systray.AddSeparator()
+// infoMenuItem 创建纯展示菜单项：无 action（空 selector）。
+// darwinkit 的 NewMenuItemWithAction 不接受 nil handler，故用 NewMenuItemWithSelector。
+// 显式 SetEnabled(true)：菜单项只有 enabled 时才显示 attributedTitle 的颜色；
+// 空 selector 不会响应点击，所以 enabled 也不会产生交互副作用。
+func (a *app) infoMenuItem(title string) appkit.MenuItem {
+	mi := appkit.NewMenuItemWithSelector(title, "", objc.Selector{})
+	mi.SetEnabled(true)
+	return mi
+}
 
-	settingsMenu := systray.AddMenuItem("设置", "设置")
-	mRefresh := settingsMenu.AddSubMenuItem("立即刷新", "立即刷新所有数据")
-	mReload := settingsMenu.AddSubMenuItem("重新加载配置", "重新加载配置文件")
-	mOpenConfig := settingsMenu.AddSubMenuItem("打开配置文件", "用编辑器打开配置文件")
-	mAutoLaunch := settingsMenu.AddSubMenuItem("开机自启", "开机自动启动")
-	mQuit := systray.AddMenuItem("退出", "退出应用")
+// addInfoItems 将 InfoItem 列表渲染进目标菜单，支持 Children 递归子菜单。
+// - 有 Value：显示 "  Label: Value" 形式
+// - 无 Value：仅显示 Label（常作为分组标题）
+// - 有 Children：该项作为带子菜单的父项，Value/Label 作为标题，Children 作为子菜单内容
+// 注意：不做项数截断。旧的 8 项上限是扁平结构时代的产物，会导致排在后面的带子菜单项被切掉。
+func (a *app) addInfoItems(menu appkit.Menu, items []provider.InfoItem) {
+	for _, item := range items {
+		menu.AddItem(a.infoItemToMenuItem(item))
+	}
+}
+
+// infoItemToMenuItem 将单个 InfoItem 转为 MenuItem。有 Children 时构建子菜单。
+func (a *app) infoItemToMenuItem(item provider.InfoItem) appkit.MenuItem {
+	// 有子项：作为带子菜单的父项
+	if len(item.Children) > 0 {
+		subMenu := appkit.NewMenuWithTitle(item.Label)
+		subMenu.SetAutoenablesItems(false)
+		a.addInfoItems(subMenu, item.Children)
+		parent := appkit.NewSubMenuItem(subMenu)
+		parent.SetTitle(item.Label)
+		return parent
+	}
+
+	// 无子项：普通展示项。
+	// 有 Highlight 时前缀水位状态点（emoji 是彩色字形，原生渲染，不依赖 attributedTitle）。
+	// 注：darwinkit 这个版本的 attributedTitle 颜色属性无法生效（FFI 层丢失），
+	// 故不用 SetAttributedTitle 上色，改用 emoji 圆点表示水位。
+	var title string
+	prefix := ""
+	if item.Highlight > 0 {
+		prefix = highlightDot(item.Highlight) + " "
+	}
+	if item.Value == "" {
+		title = prefix + item.Label
+	} else {
+		title = fmt.Sprintf("%s  %s: %s", prefix, item.Label, item.Value)
+	}
+	return a.infoMenuItem(title)
+}
+
+// highlightDot 按使用率水位返回彩色 emoji 圆点：<70% 绿、70-90% 橙、>=90% 红。
+func highlightDot(pct float64) string {
+	switch {
+	case pct >= 90:
+		return "🔴"
+	case pct >= 70:
+		return "🟠"
+	default:
+		return "🟢"
+	}
+}
+
+// buildSettingsMenu 构建设置和退出菜单（点击项绑定回调）
+func (a *app) buildSettingsMenu() settingsMenuItems {
+	a.menu.AddItem(appkit.MenuItem_SeparatorItem())
+
+	settingsMenu := appkit.NewMenuWithTitle("设置")
+	settingsMenu.SetAutoenablesItems(true)
+	mRefresh := appkit.NewMenuItemWithAction("立即刷新", "", func(objc.Object) { a.refreshAll() })
+	mReload := appkit.NewMenuItemWithAction("重新加载配置", "", func(objc.Object) { a.reloadConfig() })
+	mOpenConfig := appkit.NewMenuItemWithAction("打开配置文件", "", func(objc.Object) { a.openConfigFile() })
+	mAutoLaunch := appkit.NewMenuItemWithAction("开机自启", "", func(objc.Object) { a.toggleAutoLaunch() })
+	settingsMenu.AddItem(mRefresh)
+	settingsMenu.AddItem(mReload)
+	settingsMenu.AddItem(mOpenConfig)
+	settingsMenu.AddItem(mAutoLaunch)
 
 	if isAutoLaunchEnabled() {
-		mAutoLaunch.Check()
+		mAutoLaunch.SetState(appkit.ControlStateValueOn)
+	} else {
+		mAutoLaunch.SetState(appkit.ControlStateValueOff)
 	}
+
+	settingsItem := appkit.NewSubMenuItem(settingsMenu)
+	settingsItem.SetTitle("设置")
+	a.menu.AddItem(settingsItem)
+
+	mQuit := appkit.NewMenuItemWithAction("退出", "", func(objc.Object) { a.app.Terminate(nil) })
+	a.menu.AddItem(mQuit)
 
 	return settingsMenuItems{
 		refresh:    mRefresh,
@@ -222,29 +294,6 @@ func (a *app) buildSettingsMenu() settingsMenuItems {
 		openConfig: mOpenConfig,
 		autoLaunch: mAutoLaunch,
 		quit:       mQuit,
-	}
-}
-
-// listenSettingsEvents 监听设置菜单项事件（context 取消后退出）
-func (a *app) listenSettingsEvents(ctx context.Context, s settingsMenuItems) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-s.refresh.ClickedCh:
-			for idx := range a.providers {
-				go a.refreshProvider(idx)
-			}
-		case <-s.reload.ClickedCh:
-			a.reloadConfig()
-		case <-s.openConfig.ClickedCh:
-			a.openConfigFile()
-		case <-s.autoLaunch.ClickedCh:
-			a.toggleAutoLaunch()
-		case <-s.quit.ClickedCh:
-			a.pendingReload = false
-			systray.Quit()
-		}
 	}
 }
 
@@ -284,7 +333,7 @@ func (a *app) stopRefreshLoops() {
 	a.cancelFuncs = nil
 }
 
-// refreshProvider 刷新单个 provider 的数据并重建菜单
+// refreshProvider 刷新单个 provider：后台拉取 → 主线程重建菜单
 func (a *app) refreshProvider(idx int) {
 	result, err := a.providers[idx].provider.Fetch()
 	if err != nil {
@@ -294,48 +343,69 @@ func (a *app) refreshProvider(idx int) {
 		}
 	}
 
-	a.providers[idx].menu.lastResult = result
-
-	// 收集所有 provider 的最新结果
-	results := make([]*provider.ProviderResult, len(a.providers))
-	for i := range a.providers {
-		results[i] = a.providers[i].menu.lastResult
+	a.mu.Lock()
+	if a.providers[idx].state == nil {
+		a.providers[idx].state = &providerMenuState{}
 	}
+	a.providers[idx].state.lastResult = result
+	a.mu.Unlock()
 
-	// 全量重建菜单
-	a.rebuildAllMenus(results)
+	// UI 操作必须在主线程
+	dispatch.MainQueue().DispatchAsync(func() {
+		a.rebuildAllMenus()
+	})
+}
+
+// refreshAll 立即刷新所有 provider
+func (a *app) refreshAll() {
+	for idx := range a.providers {
+		go a.refreshProvider(idx)
+	}
 }
 
 // openConfigFile 用系统默认编辑器打开配置文件
 func (a *app) openConfigFile() {
-	_ = exec.Command("open", ConfigPath()).Start()
+	go func() {
+		_ = exec.Command("open", ConfigPath()).Start()
+	}()
 }
 
-// toggleAutoLaunch 切换开机自启
+// toggleAutoLaunch 切换开机自启，并在主线程更新菜单勾选状态
 func (a *app) toggleAutoLaunch() {
 	enabled := !isAutoLaunchEnabled()
 	if err := setAutoLaunch(enabled); err != nil {
 		log.Printf("设置开机自启: %v", err)
 		return
 	}
-	if enabled {
-		a.settings.autoLaunch.Check()
-	} else {
-		a.settings.autoLaunch.Uncheck()
-	}
+	dispatch.MainQueue().DispatchAsync(func() {
+		if enabled {
+			a.settings.autoLaunch.SetState(appkit.ControlStateValueOn)
+		} else {
+			a.settings.autoLaunch.SetState(appkit.ControlStateValueOff)
+		}
+	})
 }
 
-// reloadConfig 重载配置并重建菜单
+// reloadConfig 原地重载配置：停止旧 goroutine → 重载 → 重建 providers → 重建菜单
 func (a *app) reloadConfig() {
 	a.stopRefreshLoops()
+
 	cfg, err := LoadConfig()
 	if err != nil {
 		log.Printf("重新加载配置: %v", err)
+		dispatch.MainQueue().DispatchAsync(func() {
+			a.startRefreshLoops()
+		})
 		return
 	}
 	a.config = cfg
-	a.pendingReload = true
-	systray.Quit()
+
+	dispatch.MainQueue().DispatchAsync(func() {
+		a.providers = nil
+		a.createProviders()
+		a.rebuildAllMenus()
+		a.startRefreshLoops()
+	})
 }
 
 // truncateError 截断错误信息

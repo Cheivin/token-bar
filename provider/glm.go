@@ -94,6 +94,9 @@ func (g *glmProvider) Fetch() (*ProviderResult, error) {
 		return nil, fmt.Errorf("查询配额限制: %w", err)
 	}
 
+	var dayTokens int64
+	var dayReqs int64
+	g.fetchModelUsage(1, &dayReqs, &dayTokens)
 	// 2. 查询 7 天和 30 天模型用量
 	g.fetchModelUsage(7, &data.weekReqs, &data.weekTokens)
 	g.fetchModelUsage(30, &data.monthReqs, &data.monthTokens)
@@ -110,11 +113,11 @@ func (g *glmProvider) Fetch() (*ProviderResult, error) {
 
 	// 5小时窗口
 	result.Items = append(result.Items,
-		InfoItem{Label: "5小时", Value: ""},
-		InfoItem{Label: "  使用率", Value: fmt.Sprintf("%.2f%%", data.token5HourPct)},
+		InfoItem{Label: "5小时", Value: "", Highlight: data.token5HourPct},
+		InfoItem{Label: "    使用率", Value: fmt.Sprintf("%.2f%%", data.token5HourPct)},
 	)
 	if data.token5HourReset != "" {
-		result.Items = append(result.Items, InfoItem{Label: "  重置", Value: data.token5HourReset})
+		result.Items = append(result.Items, InfoItem{Label: "    重置", Value: data.token5HourReset})
 		result.Subtitle = fmt.Sprintf("5小时窗口 | 重置 %s", data.token5HourReset)
 	} else {
 		result.Subtitle = "5小时窗口"
@@ -122,33 +125,31 @@ func (g *glmProvider) Fetch() (*ProviderResult, error) {
 
 	// 每周窗口
 	result.Items = append(result.Items,
-		InfoItem{Label: "每周", Value: ""},
-		InfoItem{Label: "  使用率", Value: fmt.Sprintf("%.2f%%", data.tokenWeeklyPct)},
+		InfoItem{Label: "每周", Value: "", Highlight: data.tokenWeeklyPct},
+		InfoItem{Label: "    使用率", Value: fmt.Sprintf("%.2f%%", data.tokenWeeklyPct)},
 	)
 	if data.tokenWeeklyReset != "" {
-		result.Items = append(result.Items, InfoItem{Label: "  重置", Value: data.tokenWeeklyReset})
+		result.Items = append(result.Items, InfoItem{Label: "    重置", Value: data.tokenWeeklyReset})
 	}
 
 	// MCP 每月用量（如果有数据）
 	if data.mcpTotal > 0 || data.mcpUsed > 0 {
 		result.Items = append(result.Items,
-			InfoItem{Label: "MCP (每月)", Value: ""},
-			InfoItem{Label: "  用量", Value: fmt.Sprintf("%s / %s", FormatCount(data.mcpUsed), FormatCount(data.mcpTotal))},
-			InfoItem{Label: "  使用率", Value: fmt.Sprintf("%.2f%%", data.mcpPct)},
+			InfoItem{Label: "MCP (每月)", Value: "", Highlight: data.mcpPct},
+			InfoItem{Label: "    用量", Value: fmt.Sprintf("%s / %s", FormatCount(data.mcpUsed), FormatCount(data.mcpTotal))},
+			InfoItem{Label: "    使用率", Value: fmt.Sprintf("%.2f%%", data.mcpPct)},
 		)
 		if data.mcpReset != "" {
-			result.Items = append(result.Items, InfoItem{Label: "  重置", Value: data.mcpReset})
+			result.Items = append(result.Items, InfoItem{Label: "    重置", Value: data.mcpReset})
 		}
 	}
 
 	// 补充统计
 	result.Items = append(result.Items,
-		InfoItem{Label: "7天统计", Value: ""},
-		InfoItem{Label: "  请求", Value: FormatCount(data.weekReqs)},
-		InfoItem{Label: "  Token", Value: FormatToken(data.weekTokens)},
-		InfoItem{Label: "30天统计", Value: ""},
-		InfoItem{Label: "  请求", Value: FormatCount(data.monthReqs)},
-		InfoItem{Label: "  Token", Value: FormatToken(data.monthTokens)},
+		InfoItem{Label: "统计", Children: []InfoItem{
+			{Label: "7天", Value: fmt.Sprintf("%s(Tok)/%s(Req)", FormatToken(data.weekTokens), FormatCount(data.weekReqs))},
+			{Label: "30天", Value: fmt.Sprintf("%s(Tok)/%s(Req)", FormatToken(data.monthTokens), FormatCount(data.monthReqs))},
+		}},
 	)
 
 	// MCP 工具用量（如果有数据）
@@ -283,6 +284,10 @@ func (g *glmProvider) fetchModelUsage(days int, outReqs, outTokens *int64) {
 				TotalModelCallCount int64 `json:"totalModelCallCount"`
 				TotalTokensUsage    int64 `json:"totalTokensUsage"`
 			} `json:"totalUsage"`
+			ModelSummaryList []struct {
+				ModelName   string `json:"modelName"`
+				TotalTokens int64  `json:"totalTokens"`
+			} `json:"modelSummaryList"`
 		} `json:"data"`
 	}
 

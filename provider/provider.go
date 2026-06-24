@@ -15,8 +15,10 @@ type ProviderResult struct {
 
 // InfoItem 附加信息项
 type InfoItem struct {
-	Label string // 如 "用量"、"使用率"
-	Value string // 如 "296.00M / 800.00M"
+	Label     string     // 如 "用量"、"使用率"
+	Value     string     // 如 "296.00M / 800.00M"
+	Children  []InfoItem // 子菜单项（可选）
+	Highlight float64    // 高亮数值（0-100，如使用率）。>0 时按水位阈值给该行着色，0 表示不着色。
 }
 
 // Provider 数据提供者接口

@@ -137,7 +137,7 @@ providers:
 
 ```
 .
-├── main.go           # 入口、热重载循环
+├── main.go           # 入口，启动 darwinkit 事件循环
 ├── app.go            # 应用核心：菜单构建、事件循环、定时刷新
 ├── config.go         # 配置加载/保存
 ├── autolaunch.go     # 开机自启管理

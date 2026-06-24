@@ -3,11 +3,6 @@ module token-bar
 go 1.26
 
 require (
-	fyne.io/systray v1.12.0
+	github.com/progrium/darwinkit v0.5.1-0.20240715194340-61b9e31a12fa
 	gopkg.in/yaml.v3 v3.0.1
-)
-
-require (
-	github.com/godbus/dbus/v5 v5.1.0 // indirect
-	golang.org/x/sys v0.15.0 // indirect
 )

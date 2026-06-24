@@ -11,16 +11,21 @@ ICONSET     := packaging/$(APP_NAME).iconset
 ICNS        := packaging/icon.icns
 DIST_ZIP    := dist/$(APP_NAME)-$(VERSION).zip
 
+# 绕过 Go 1.25+ arm64 编译器优化器 bug（progrium/darwinkit issue #286）：
+# 优化器为 darwinkit 的 libffi cgo 调用生成错误代码，导致 Application.Run() 运行时 SIGABRT。
+# 关闭优化(-N)与内联(-l)可规避。详见 https://github.com/progrium/darwinkit/issues/286
+GCFLAGS     := -gcflags="all=-N -l"
+
 .PHONY: build build-universal icon app package clean release
 
 # 编译当前架构二进制
 build:
-	go build -o $(BINARY) .
+	go build $(GCFLAGS) -o $(BINARY) .
 
 # 编译通用二进制（同时支持 Apple Silicon 和 Intel）
 build-universal:
-	CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 CC="clang -target arm64-apple-macos11" go build -o $(BINARY)_arm64 .
-	CGO_ENABLED=1 GOOS=darwin GOARCH=amd64 CC="clang -target x86_64-apple-macos10.12" go build -o $(BINARY)_amd64 .
+	CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 CC="clang -target arm64-apple-macos11" go build $(GCFLAGS) -o $(BINARY)_arm64 .
+	CGO_ENABLED=1 GOOS=darwin GOARCH=amd64 CC="clang -target x86_64-apple-macos10.12" go build $(GCFLAGS) -o $(BINARY)_amd64 .
 	lipo -create -output $(BINARY) $(BINARY)_arm64 $(BINARY)_amd64
 	@rm -f $(BINARY)_arm64 $(BINARY)_amd64
 	@echo "已生成通用二进制 $(BINARY)"
