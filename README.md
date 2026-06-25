@@ -74,6 +74,13 @@ providers:
     params:
       command: "./my-script.sh"      # 相对于 ~/.token-bar/ 目录
       timeout: "10s"
+
+  # OpenCode Go 套餐（opencode.ai）
+  - name: OpenCode
+    type: opencode
+    params:
+      workspace_id: "wrk_xxxxxxxx"   # workspace ID
+      auth_cookie: "Fe26.2*..."      # 浏览器登录后的 auth cookie（会过期）
 ```
 
 ### Provider 类型
@@ -82,6 +89,7 @@ providers:
 |------|------|----------|
 | `glm` | GLM/Z.AI 用量 | `api_key` |
 | `newapi` | NewAPI 平台 | `base_url`, `token` |
+| `opencode` | OpenCode Go 套餐 | `workspace_id`, `auth_cookie` |
 | `exec` | 自定义命令 | `command` |
 
 ### GLM Provider
@@ -105,6 +113,19 @@ providers:
 - 账户余额
 - 已用总量
 - RPM/TPM 统计
+
+### OpenCode Provider
+
+监控 [opencode.ai](https://opencode.ai) Go 套餐用量，复用浏览器已登录的 auth cookie 请求用量页面：
+
+- **滚动用量** / **每周用量** / **每月用量** 三窗口使用率及重置时间
+- 状态非 `ok`（如 `rate-limited`）时对应窗口红色高亮
+
+参数说明：
+- `workspace_id` — 形如 `wrk_xxx` 的 workspace ID，可从用量页 URL 取得
+- `auth_cookie` — 浏览器登录后的 `auth` cookie 值（Iron 加密格式，形如 `Fe26.2*...`）。**会过期**，失效时（HTTP 401/403）只需更新这一项，无需重启应用
+
+> 获取方式：浏览器登录 opencode.ai 后，打开 DevTools → Application → Cookies，复制 `auth` 的值；或从 Network 请求头的 `Cookie` 中提取 `auth=...`。
 
 ### Exec Provider
 
@@ -145,6 +166,7 @@ providers:
     ├── provider.go   # Provider 接口与工具函数
     ├── glm.go        # GLM/Z.AI 实现
     ├── newapi.go     # NewAPI 平台实现
+    ├── opencode.go   # OpenCode Go 套餐实现
     └── exec.go       # 自定义命令实现
 ```
 

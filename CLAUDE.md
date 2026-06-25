@@ -41,6 +41,7 @@ type Provider interface {
 - `provider/glm.go` — GLM/Z.AI 平台（配额限制 + 模型用量 + 工具用量三个 API 聚合）
 - `provider/newapi.go` — NewAPI/OneAPI 平台（status + user/self + log/stat 三个 API 聚合）
 - `provider/exec.go` — 执行外部命令解析 JSON 输出
+- `provider/opencode.go` — OpenCode Go 套餐（请求用量页面，正则解析 SolidJS SSR 注入的 hydration 数据）。params：`workspace_id`（`wrk_xxx`）、`auth_cookie`（hapi Iron 加密的 auth 值，会过期，过期时只改这一项）。仅带 auth cookie + user-agent 两个最小请求头。
 
 `provider.NewProvider()` 工厂函数根据 `ProviderConfig.Type` 字段分发创建。新增数据源只需实现 `Provider` 接口并在工厂函数中注册。
 

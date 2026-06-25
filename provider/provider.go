@@ -45,6 +45,8 @@ func NewProvider(cfg ProviderConfig) (Provider, error) {
 		return newExecProvider(cfg)
 	case "newapi":
 		return newAPIProvider(cfg)
+	case "opencode":
+		return newOpenCodeProvider(cfg)
 	default:
 		return nil, fmt.Errorf("未知 provider 类型: %s", cfg.Type)
 	}
