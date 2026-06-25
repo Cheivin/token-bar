@@ -3,8 +3,6 @@ package claude
 import (
 	"log"
 	"sync"
-
-	"github.com/gen2brain/beeep"
 )
 
 // NotifyTrigger 描述一次需要发通知的状态转换类型。
@@ -17,34 +15,66 @@ const (
 	TriggerFailed                // 执行失败
 )
 
+// NotifyFunc 发送一条桌面通知。由调用方注入具体实现
+// （claude 包本身不依赖 UI 框架，便于测试与跨平台）。
+type NotifyFunc func(title, body string) error
+
+// noopNotify 默认空实现，确保 Notifier 即使未注入 NotifyFunc 也不会 panic。
+func noopNotify(string, string) error { return nil }
+
 // Notifier 跟踪每个会话的上一次状态，检测转换并触发桌面通知。
 //
 // 通知触发条件（与 CC-Status 一致）：
 //   - working → blocked：宿主终端不在前台时通知"等待输入"
 //   - → done：宿主不在前台时通知"任务完成"
 //   - → failed：宿主不在前台时通知"执行失败"
+//
+// 首次调用 CheckAndNotify 只建立 baseline（记录当前状态），不产生任何通知，
+// 避免应用启动时对已存在的 blocked/done 会话误报。
 type Notifier struct {
-	mu       sync.Mutex
-	prev     map[int]string // pid → 上一次 EffectiveState
-	hostCheck func(*Session) *HostApp // 可注入的宿主检测（主线程回调），默认 nil=始终认为不在前台
+	mu          sync.Mutex
+	prev        map[int]string          // pid → 上一次 EffectiveState
+	initialized bool                    // 是否已完成首次 baseline 建立
+	hostCheck   func(*Session) *HostApp // 可注入的宿主检测（主线程回调），默认 nil=始终认为不在前台
+	notify      NotifyFunc              // 通知发送实现，由调用方注入
 }
 
 // NewNotifier 创建通知器。
 // hostCheck 必须在主线程执行 NSWorkspace 调用，由调用方注入；
 // 若为 nil 则视为"宿主永不在前台"，即总是发通知。
-func NewNotifier(hostCheck func(*Session) *HostApp) *Notifier {
+// notify 为通知发送实现，nil 时使用空实现（仅记日志用途，如测试）。
+func NewNotifier(hostCheck func(*Session) *HostApp, notify NotifyFunc) *Notifier {
+	if notify == nil {
+		notify = noopNotify
+	}
 	return &Notifier{
 		prev:      make(map[int]string),
 		hostCheck: hostCheck,
+		notify:    notify,
 	}
 }
 
 // CheckAndNotify 对照当前会话集合，对发生关注转换的会话发通知。
 // 应在主线程调用（因 hostCheck 内部调用 NSWorkspace）。
+//
+// 首次调用只记录当前所有会话状态作为 baseline，不产生通知，
+// 避免应用启动时已存在的 blocked/done 会话触发误报。
 func (n *Notifier) CheckAndNotify(current map[int]*Session) {
 	n.mu.Lock()
+
+	// 首次调用：仅建立 baseline，不发任何通知
+	if !n.initialized {
+		n.prev = make(map[int]string, len(current))
+		for pid, s := range current {
+			n.prev[pid] = s.EffectiveState()
+		}
+		n.initialized = true
+		n.mu.Unlock()
+		return
+	}
+
 	prev := n.prev
-	// 先算出要发的通知，再异步发（beeep 内部 fork 子进程，不阻塞主线程）
+	// 先算出要发的通知，再异步发（避免阻塞主线程）
 	type pending struct {
 		title string
 		body  string
@@ -53,7 +83,6 @@ func (n *Notifier) CheckAndNotify(current map[int]*Session) {
 
 	for pid, s := range current {
 		prevState := prev[pid]
-		currState := s.EffectiveState()
 		trigger, title, body := n.classify(prevState, s)
 		if trigger == TriggerNone {
 			continue
@@ -66,7 +95,6 @@ func (n *Notifier) CheckAndNotify(current map[int]*Session) {
 			}
 		}
 		pendings = append(pendings, pending{title: title, body: body})
-		_ = currState
 	}
 
 	// 更新上一次状态：以当前集合为准（消失的会话会被清理）
@@ -76,13 +104,12 @@ func (n *Notifier) CheckAndNotify(current map[int]*Session) {
 	}
 	n.mu.Unlock()
 
-	// 异步发通知，避免阻塞主线程
+	// 发送通知：notify 实现自行处理线程派发（如 dispatch.MainQueue），
+	// 故此处直接同步调用即可。
 	for _, p := range pendings {
-		go func(title, body string) {
-			if err := beeep.Notify(title, body, ""); err != nil {
-				log.Printf("claude: 发送通知失败: %v", err)
-			}
-		}(p.title, p.body)
+		if err := n.notify(p.title, p.body); err != nil {
+			log.Printf("claude: 发送通知失败: %v", err)
+		}
 	}
 }
 

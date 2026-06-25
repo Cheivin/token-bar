@@ -34,9 +34,9 @@ type Session struct {
 	Kind       string `json:"kind"`
 	StartedAt  int64  `json:"startedAt"`
 	SessionID  string `json:"sessionId"`
-	State      string `json:"state"`       // 新版：working/blocked/done/failed/stopped
-	Status     string `json:"status"`      // 旧版：busy/waiting/idle
-	WaitingFor string `json:"waitingFor"`  // 等待原因，如 "dialog open"
+	State      string `json:"state"`      // 新版：working/blocked/done/failed/stopped
+	Status     string `json:"status"`     // 旧版：busy/waiting/idle
+	WaitingFor string `json:"waitingFor"` // 等待原因，如 "dialog open"
 	ID         string `json:"id"`
 	Name       string `json:"name"`
 }

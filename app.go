@@ -358,9 +358,11 @@ func (a *app) startClaudeMonitor() {
 	a.claudeCancel = cancel
 
 	// 宿主检测注入：DetectHostApp 调用 appkit，必须在主线程执行
+	// 通知发送注入：用 darwinkit 原生 NSUserNotificationCenter，通知归属本应用
+	// （com.cheivin.token-bar），图标与标题自然正确，避免 beeep/osascript 显示"脚本编辑器"。
 	a.claudeNotifier = claude.NewNotifier(func(s *claude.Session) *claude.HostApp {
 		return claude.DetectHostApp(s.PID)
-	})
+	}, notifyUser)
 
 	m, err := claude.NewMonitor(func(sessions map[int]*claude.Session) {
 		// 快照深拷贝，避免后台 goroutine 与菜单重建竞争
@@ -494,45 +496,61 @@ func stateDot(st string) string {
 
 // statusBarTitle 组装状态栏按钮标题：[会话圆点] | <provider 标题>。
 // 会话圆点最多展示 3 个，超出用 +N 提示；无活跃会话时不加前缀。
+//
+// 状态栏只展示"活跃"会话（working/blocked/failed/stopped）；
+// 已完成（done/idle）仅在菜单内展示，不占状态栏位置，避免标题被历史会话刷屏。
 func (a *app) statusBarTitle(providerTitle string) string {
 	snap := a.claudeSessions
-	if len(snap) == 0 {
+
+	// 过滤出活跃会话（done/idle 不上状态栏）
+	active := make([]*claude.Session, 0, len(snap))
+	for _, s := range snap {
+		if isStatusBarActive(s.EffectiveState()) {
+			active = append(active, s)
+		}
+	}
+	if len(active) == 0 {
 		return providerTitle
 	}
 
 	// 按 startedAt 倒序，最近活跃的会话优先展示
-	pids := make([]int, 0, len(snap))
-	for pid := range snap {
-		pids = append(pids, pid)
-	}
-	sort.Slice(pids, func(i, j int) bool {
-		si, sj := snap[pids[i]].StartedAt, snap[pids[j]].StartedAt
-		if si != sj {
-			return si > sj
+	sort.Slice(active, func(i, j int) bool {
+		if active[i].StartedAt != active[j].StartedAt {
+			return active[i].StartedAt > active[j].StartedAt
 		}
-		return snap[pids[i]].ProjectName() < snap[pids[j]].ProjectName()
+		return active[i].ProjectName() < active[j].ProjectName()
 	})
 
 	const maxDots = 3
 	var dots strings.Builder
 	shown := 0
-	for _, pid := range pids {
+	for _, s := range active {
 		if shown >= maxDots {
 			break
 		}
-		dots.WriteString(stateDot(snap[pid].EffectiveState()))
+		dots.WriteString(stateDot(s.EffectiveState()))
 		shown++
 	}
 
 	prefix := dots.String()
-	if len(pids) > maxDots {
-		prefix = fmt.Sprintf("%s+%d", prefix, len(pids)-maxDots)
+	if len(active) > maxDots {
+		prefix = fmt.Sprintf("%s+%d", prefix, len(active)-maxDots)
 	}
 
 	if providerTitle == "" {
 		return prefix
 	}
 	return prefix + " | " + providerTitle
+}
+
+// isStatusBarActive 判断会话状态是否需要在状态栏圆点中展示。
+// done/idle 视为已结束，不上状态栏（仅菜单内可见）。
+func isStatusBarActive(st string) bool {
+	switch st {
+	case claude.StateWorking, claude.StateBlocked, claude.StateFailed, claude.StateStopped:
+		return true
+	}
+	return false
 }
 
 // refreshProvider 刷新单个 provider：后台拉取 → 主线程重建菜单
