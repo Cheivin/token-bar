@@ -5,9 +5,12 @@ import (
 	"fmt"
 	"log"
 	"os/exec"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
+	"token-bar/claude"
 	"token-bar/provider"
 
 	"github.com/progrium/darwinkit/dispatch"
@@ -30,6 +33,12 @@ type app struct {
 	cancelFuncs []context.CancelFunc
 
 	settings settingsMenuItems // 当前设置菜单项引用
+
+	// Claude Code 会话监控（独立于 provider 体系，事件驱动）
+	claudeMonitor  *claude.Monitor
+	claudeNotifier *claude.Notifier
+	claudeCancel   context.CancelFunc
+	claudeSessions map[int]*claude.Session // 最近一次会话快照（受 mu 保护）
 }
 
 // providerInstance 单个 provider 运行时实例
@@ -70,9 +79,11 @@ func (a *app) start(delegate *appkit.ApplicationDelegate) {
 	// 应用退出前停止刷新 goroutine
 	delegate.SetApplicationWillTerminate(func(foundation.Notification) {
 		a.stopRefreshLoops()
+		a.stopClaudeMonitor()
 	})
 
 	a.startRefreshLoops()
+	a.startClaudeMonitor()
 }
 
 // createStatusItem 创建状态栏项（整个生命周期常驻）
@@ -132,6 +143,9 @@ func (a *app) rebuildAllMenus() {
 
 	a.menu.RemoveAllItems()
 
+	// Claude Code 会话监控优先展示（独立一级公民）
+	a.buildClaudeMenu()
+
 	// primary provider：一级菜单展示详情
 	for i := range a.providers {
 		if a.providers[i].config.Primary {
@@ -145,17 +159,20 @@ func (a *app) rebuildAllMenus() {
 		}
 	}
 
-	// 更新状态栏标题与 tooltip（取第一个 primary）
+	// 更新状态栏标题与 tooltip：
+	// 格式 [会话圆点] | <primary provider 标题>，圆点最多展示 3 个。
 	a.primary = ""
+	var providerTitle string
 	for i := range a.providers {
 		if a.providers[i].config.Primary && results[i] != nil {
-			a.button.SetTitle(results[i].Title)
+			providerTitle = results[i].Title
 			if results[i].Subtitle != "" {
 				a.primary = results[i].Subtitle
 			}
 			break
 		}
 	}
+	a.button.SetTitle(a.statusBarTitle(providerTitle))
 	a.button.SetToolTip(a.primary)
 
 	a.settings = a.buildSettingsMenu()
@@ -331,6 +348,191 @@ func (a *app) stopRefreshLoops() {
 		cancel()
 	}
 	a.cancelFuncs = nil
+}
+
+// startClaudeMonitor 启动 Claude Code 会话监控（事件驱动，独立于 provider 轮询）。
+// onChange 在后台 fsnotify goroutine 触发：先存快照，再派发主线程重建菜单 + 通知检查。
+// 通知的宿主前台检测需主线程，故 CheckAndNotify 在主线程闭包内执行。
+func (a *app) startClaudeMonitor() {
+	_, cancel := context.WithCancel(context.Background())
+	a.claudeCancel = cancel
+
+	// 宿主检测注入：DetectHostApp 调用 appkit，必须在主线程执行
+	a.claudeNotifier = claude.NewNotifier(func(s *claude.Session) *claude.HostApp {
+		return claude.DetectHostApp(s.PID)
+	})
+
+	m, err := claude.NewMonitor(func(sessions map[int]*claude.Session) {
+		// 快照深拷贝，避免后台 goroutine 与菜单重建竞争
+		snap := make(map[int]*claude.Session, len(sessions))
+		for k, v := range sessions {
+			cp := *v
+			snap[k] = &cp
+		}
+
+		a.mu.Lock()
+		a.claudeSessions = snap
+		a.mu.Unlock()
+
+		// UI 与通知检查均需主线程
+		dispatch.MainQueue().DispatchAsync(func() {
+			a.rebuildAllMenus()
+			a.claudeNotifier.CheckAndNotify(snap)
+		})
+	})
+	if err != nil {
+		log.Printf("启动 Claude 监控失败: %v", err)
+		return
+	}
+	a.claudeMonitor = m
+}
+
+// stopClaudeMonitor 停止 Claude Code 会话监控。
+func (a *app) stopClaudeMonitor() {
+	if a.claudeCancel != nil {
+		a.claudeCancel()
+		a.claudeCancel = nil
+	}
+	if a.claudeMonitor != nil {
+		a.claudeMonitor.Close()
+		a.claudeMonitor = nil
+	}
+}
+
+// buildClaudeMenu 构建 Claude Code 会话监控菜单。
+// 无活跃会话时不显示任何项；有会话时展示一个子菜单汇总。
+// 必须在主线程调用（rebuildAllMenus 内部，已持有 mu）。
+func (a *app) buildClaudeMenu() {
+	snap := a.claudeSessions
+	if len(snap) == 0 {
+		return
+	}
+
+	// 按项目名排序，保证菜单稳定
+	pids := make([]int, 0, len(snap))
+	for pid := range snap {
+		pids = append(pids, pid)
+	}
+	sort.Slice(pids, func(i, j int) bool {
+		return snap[pids[i]].ProjectName() < snap[pids[j]].ProjectName()
+	})
+
+	var items []provider.InfoItem
+	blocked, working, finished := 0, 0, 0
+	for _, pid := range pids {
+		s := snap[pid]
+		st := s.EffectiveState()
+		dot := stateDot(st)
+		switch st {
+		case claude.StateBlocked:
+			blocked++
+		case claude.StateWorking:
+			working++
+		case claude.StateDone, claude.StateIdle, claude.StateFailed, claude.StateStopped:
+			finished++
+		}
+
+		label := fmt.Sprintf("%s %s", dot, s.ProjectName())
+		var value string
+		if st == claude.StateBlocked && s.WaitingFor != "" {
+			value = s.WaitingFor
+		} else {
+			value = stateLabel(st)
+		}
+		items = append(items, provider.InfoItem{Label: label, Value: value})
+	}
+
+	// 汇总标题：显示最差状态
+	headerDot := "⚪"
+	switch {
+	case blocked > 0:
+		headerDot = "🟠"
+	case working > 0:
+		headerDot = "🟢"
+	}
+	header := fmt.Sprintf("%s Claude Code（%d 会话）", headerDot, len(snap))
+
+	// 用现有 InfoItem 渲染：header 作为带子菜单的父项
+	a.addInfoItems(*a.menu, []provider.InfoItem{
+		{Label: header, Children: items},
+	})
+}
+
+// stateLabel 将规范状态转为中文展示标签。
+func stateLabel(st string) string {
+	switch st {
+	case claude.StateWorking:
+		return "执行中"
+	case claude.StateBlocked:
+		return "等待输入"
+	case claude.StateDone, claude.StateIdle:
+		return "已完成"
+	case claude.StateFailed:
+		return "失败"
+	case claude.StateStopped:
+		return "已停止"
+	}
+	return st
+}
+
+// stateDot 将规范状态映射为状态栏/菜单用的圆点 emoji。
+func stateDot(st string) string {
+	switch st {
+	case claude.StateWorking:
+		return "🟢"
+	case claude.StateBlocked:
+		return "🟠"
+	case claude.StateDone, claude.StateIdle:
+		return "🔵"
+	case claude.StateFailed:
+		return "🔴"
+	case claude.StateStopped:
+		return "⚫"
+	}
+	return "⚪"
+}
+
+// statusBarTitle 组装状态栏按钮标题：[会话圆点] | <provider 标题>。
+// 会话圆点最多展示 3 个，超出用 +N 提示；无活跃会话时不加前缀。
+func (a *app) statusBarTitle(providerTitle string) string {
+	snap := a.claudeSessions
+	if len(snap) == 0 {
+		return providerTitle
+	}
+
+	// 按 startedAt 倒序，最近活跃的会话优先展示
+	pids := make([]int, 0, len(snap))
+	for pid := range snap {
+		pids = append(pids, pid)
+	}
+	sort.Slice(pids, func(i, j int) bool {
+		si, sj := snap[pids[i]].StartedAt, snap[pids[j]].StartedAt
+		if si != sj {
+			return si > sj
+		}
+		return snap[pids[i]].ProjectName() < snap[pids[j]].ProjectName()
+	})
+
+	const maxDots = 3
+	var dots strings.Builder
+	shown := 0
+	for _, pid := range pids {
+		if shown >= maxDots {
+			break
+		}
+		dots.WriteString(stateDot(snap[pid].EffectiveState()))
+		shown++
+	}
+
+	prefix := dots.String()
+	if len(pids) > maxDots {
+		prefix = fmt.Sprintf("%s+%d", prefix, len(pids)-maxDots)
+	}
+
+	if providerTitle == "" {
+		return prefix
+	}
+	return prefix + " | " + providerTitle
 }
 
 // refreshProvider 刷新单个 provider：后台拉取 → 主线程重建菜单
